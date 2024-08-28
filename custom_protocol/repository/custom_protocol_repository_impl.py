@@ -1,7 +1,14 @@
 import asyncio
 import concurrent
+import json
+import os
+import signal
+import subprocess
 import threading
+from multiprocessing import shared_memory
 from queue import Queue
+
+import mmap
 
 from custom_protocol.entity.custom_protocol import CustomProtocolNumber
 from custom_protocol.repository.custom_protocol_repository import CustomProtocolRepository
@@ -50,7 +57,7 @@ class CustomProtocolRepositoryImpl(CustomProtocolRepository):
                 (UserDefinedProtocolNumber is not None and UserDefinedProtocolNumber.hasValue(protocolNumber.value))):
             raise ValueError("프로토콜을 등록 시 반드시 CustomProtocolNumber 혹은 UserDefinedProtocolNumber에 정의된 값을 사용하세요")
         if not callable(customFunction):
-            raise  ValueError("customFunction은 프로토콜에 대응하는 함수입니다")
+            raise ValueError("customFunction은 프로토콜에 대응하는 함수입니다")
 
         self.__protocolTable[protocolNumber.value] = customFunction
 
@@ -99,63 +106,32 @@ class CustomProtocolRepositoryImpl(CustomProtocolRepository):
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
 
-    def macosThreadExecutionFunction(self, userDefinedFunction, parameterList):
-        result_queue = Queue()
-
-        # 스레드에서 비동기 작업 실행
-        thread = threading.Thread(target=self.execute_in_thread,
-                                  args=(userDefinedFunction, parameterList, result_queue))
-        thread.start()
-        thread.join()
-
-        result = result_queue.get()
-        if isinstance(result, Exception):
-            raise result
-        return result
-    
-    # def macosThreadExecutionFunction(self, userDefinedFunction, parameterList):
-    #     loop = asyncio.new_event_loop()
-    #     asyncio.set_event_loop(loop)
-    #     ColorPrinter.print_important_message("macosThreadExecutionFunction loop creation")
-    #
-    #     future = loop.create_task(self.__executeAsyncFunction(userDefinedFunction, parameterList))
-    #     ColorPrinter.print_important_message("macosThreadExecutionFunction task creation")
-    #     result = loop.run_until_complete(future)
-    #     ColorPrinter.print_important_message("macosThreadExecutionFunction get result")
-    #
-    #     loop.run_until_complete(loop.shutdown_asyncgens())
-    #     loop.close()
-    #     ColorPrinter.print_important_message("macosThreadExecutionFunction loop finish")
-    #
-    #     return result
-
-    # def macosThreadExecutionFunction(self, userDefinedFunction, parameterList):
-    #     def run_in_thread(loop, userDefinedFunction, parameterList, resultQueue):
-    #         ColorPrinter.print_important_message("run_in_thread start")
+    # TODO: 추후 개선이 필요하겠지만 지금은 그냥 Rust 코드로 구동하자 (Mac OS 전용)
+    # async def macosThreadExecutionFunction(self, userDefinedFunction, parameterList):
+    #     def threadFunction(loop, resultQueue):
     #         asyncio.set_event_loop(loop)
-    #         ColorPrinter.print_important_message("run_in_thread loop creation")
+    #
     #         try:
-    #             future = asyncio.run_coroutine_threadsafe(self.__executeAsyncFunction(userDefinedFunction, parameterList), loop)
-    #             ColorPrinter.print_important_data("run_in_thread run_coroutine_threadsafe", future)
-    #             resultQueue.put(future.result())
-    #             ColorPrinter.print_important_message("finish internal thread")
+    #             serviceInstance = userDefinedFunction.__self__
+    #
+    #             if hasattr(serviceInstance, userDefinedFunction.__name__):
+    #                 result = loop.run_until_complete(getattr(serviceInstance, userDefinedFunction.__name__)(*parameterList))
+    #             else:
+    #                 raise ValueError("함수 구성이 잘못되었음!")
+    #
+    #             resultQueue.put(result)
     #         except Exception as e:
     #             resultQueue.put(e)
+    #         finally:
+    #             loop.run_until_complete(loop.shutdown_asyncgens())
+    #             loop.close()
     #
-    #     loop = asyncio.new_event_loop()
-    #     ColorPrinter.print_important_message("macosThreadExecutionFunction loop creation")
     #     resultQueue = Queue()
-    #     ColorPrinter.print_important_message("macosThreadExecutionFunction queue creation")
+    #     loop = asyncio.new_event_loop()
     #
-    #     thread = threading.Thread(target=run_in_thread, args=(loop, userDefinedFunction, parameterList, resultQueue))
-    #     ColorPrinter.print_important_message("macosThreadExecutionFunction thread creation")
+    #     thread = threading.Thread(target=threadFunction, args=(loop, resultQueue))
     #     thread.start()
-    #     ColorPrinter.print_important_message("macosThreadExecutionFunction thread start")
     #     thread.join()
-    #
-    #     loop.run_until_complete(loop.shutdown_asyncgens())
-    #     ColorPrinter.print_important_message("macosThreadExecutionFunction loop finish")
-    #     loop.close()
     #
     #     result = resultQueue.get()
     #     ColorPrinter.print_important_data("macosThreadExecutionFunction result", result)
@@ -164,22 +140,112 @@ class CustomProtocolRepositoryImpl(CustomProtocolRepository):
     #
     #     return result
 
+    def macosThreadExecutionFunction(self, userDefinedFunction, parameterList):
+        # Mac OS에서 Project Top으로 잡힘
+        currentWorkDirectory = os.getcwd()
+
+        rustBinaryRelativePath = "task_executor/target/release/task_executor"
+        rustBinaryAbsolutePath = os.path.join(currentWorkDirectory, rustBinaryRelativePath)
+
+        fullPackagePath = userDefinedFunction.__module__
+        basePackagePath = fullPackagePath.split(".")[0]
+        className = userDefinedFunction.__self__.__class__.__name__
+        userDefinedFunctionName = userDefinedFunction.__name__
+
+        ColorPrinter.print_important_data("fullPackagePath", fullPackagePath)
+        ColorPrinter.print_important_data("basePackagePath", basePackagePath)
+        ColorPrinter.print_important_data("className", className)
+        ColorPrinter.print_important_data("userDefinedFunctionName", userDefinedFunctionName)
+
+        sharedMemorySize = 4096
+        sharedMemory = shared_memory.SharedMemory(create=True, size=sharedMemorySize, name="rust_shared_memory")
+
+        executedMessage = None
+
+        try:
+            rustProcess = subprocess.run([
+                rustBinaryAbsolutePath,
+                fullPackagePath,
+                basePackagePath,
+                className,
+                userDefinedFunctionName,
+                json.dumps(parameterList)
+            ], capture_output=True, text=True)
+            # rustProcess = subprocess.Popen([
+            #     rustBinaryAbsolutePath,
+            #     fullPackagePath,
+            #     basePackagePath,
+            #     className,
+            #     userDefinedFunctionName,
+            #     json.dumps(parameterList)
+            # ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            ColorPrinter.print_important_data("Rust Task Executor 구동 결과", rustProcess)
+
+            message = self.read_from_shared_memory(sharedMemory, sharedMemorySize)
+            ColorPrinter.print_important_data("Shared Memory Message", message)
+
+            executedMessage = {"result": message}
+
+        except Exception as e:
+            ColorPrinter.print_important_data("바이너리 구동에 실패! (바이너리를 생성하세요)", str(e))
+
+        return executedMessage
+
+    # def read_from_shared_memory(self):
+    #     # Rust에서 사용한 공유 메모리 ID와 동일해야 합니다.
+    #     shm_key = "rust_shared_memory"
+    #     shm_size = 4096  # Rust에서 설정한 공유 메모리의 크기와 동일해야 합니다.
+    #
+    #     # 공유 메모리 열기
+    #     with open(f"/dev/shm/{shm_key}", "r+b") as f:
+    #         # mmap을 통해 공유 메모리 매핑
+    #         mm = mmap.mmap(f.fileno(), shm_size, access=mmap.ACCESS_READ)
+    #         # 공유 메모리에서 데이터를 읽어들임
+    #         data = mm[:shm_size].decode('utf-8').rstrip('\x00')  # '\x00' 패딩 제거
+    #         mm.close()
+    #     return data
+
+    def read_from_shared_memory(self, sharedMemory, sharedMemorySize):
+        # shm_key = "rust_shared_memory"
+        # shm_size = 4096
+
+        try:
+            # Open the shared memory
+            # existing_shm = shared_memory.SharedMemory(name=shm_key)
+            # Read from the shared memory
+            data = bytes(sharedMemory.buf[:sharedMemorySize]).decode('utf-8').rstrip('\x00')
+            sharedMemory.close()
+            sharedMemory.unlink()
+
+        except FileNotFoundError:
+            return "Shared memory segment not found."
+        except Exception as e:
+            return f"Error accessing shared memory: {e}"
+
+        return data
+
     def execute(self, requestObject):
-        ColorPrinter.print_important_data("CommandExecutor requestObject -> protocolNumber", requestObject.getProtocolNumber())
+        ColorPrinter.print_important_data("CommandExecutor requestObject -> protocolNumber",
+                                          requestObject.getProtocolNumber())
         ColorPrinter.print_important_data("customFunction", self.__protocolTable[requestObject.getProtocolNumber()])
 
         userDefinedFunction = self.__protocolTable[requestObject.getProtocolNumber()]
 
         parameterList = self.__extractParameterList(requestObject)
 
+        # TODO: 실제로는 의존성 분석을 해서 내부에 async 쓰는게 있으면
+        # 무조건 코루틴 태우도록 구성해야함
+        # 우선은 Custom Function은 무조건 async 붙이도록 하자
         if asyncio.iscoroutinefunction(userDefinedFunction):
+            ColorPrinter.print_important_message("Coroutine Start")
             osType = OperatingSystemDetector.checkCurrentOperatingSystem()
             osDependentThreadExecuteFunction = self.__osDependentThreadExecutionTable[osType]
             result = osDependentThreadExecuteFunction(userDefinedFunction, parameterList)
         else:
+            ColorPrinter.print_important_message("Non-Coroutine Start")
             result = self.__executeSynchronizeFunction(userDefinedFunction, parameterList)
+            ColorPrinter.print_important_message("User Defined Protocol 함수는 반드시 async로 구성해야합니다")
 
         ColorPrinter.print_important_data("result", result)
 
         return result
-    
